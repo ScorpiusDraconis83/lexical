@@ -32,8 +32,10 @@ import {
   $getNearestNodeFromDOMNode,
   $getPreviousSelection,
   $getSelection,
+  $isDecoratorNode,
   $isElementNode,
   $isRangeSelection,
+  $isRootOrShadowRoot,
   $isTextNode,
   $setSelection,
   COMMAND_PRIORITY_CRITICAL,
@@ -68,7 +70,7 @@ import {
   $createTableSelection,
   $isTableSelection,
 } from './LexicalTableSelection';
-import {$computeTableMap} from './LexicalTableUtils';
+import {$computeTableMap, $getNodeTriplet} from './LexicalTableUtils';
 
 const LEXICAL_ELEMENT_KEY = '__lexicalTableSelection';
 
@@ -316,7 +318,27 @@ export function applyTableHandlers(
     const selection = $getSelection();
 
     if (!$isSelectionInTable(selection, tableNode)) {
-      return false;
+      const nodes = selection ? selection.getNodes() : null;
+      if (nodes) {
+        const table = nodes.find(
+          (node) =>
+            $isTableNode(node) && node.getKey() === tableObserver.tableNodeKey,
+        );
+        if ($isTableNode(table)) {
+          const parentNode = table.getParent();
+          if (!parentNode) {
+            return false;
+          }
+          const nextNode = table.getNextSibling() || table.getPreviousSibling();
+          table.remove();
+          if (nextNode) {
+            nextNode.selectStart();
+          } else {
+            parentNode.selectStart();
+          }
+        }
+      }
+      return true;
     }
 
     if ($isTableSelection(selection)) {
@@ -715,9 +737,18 @@ export function applyTableHandlers(
           if (isPartialyWithinTable) {
             const newSelection = selection.clone();
             if (isFocusInside) {
+              const [tableMap] = $computeTableMap(
+                tableNode,
+                focusCellNode,
+                focusCellNode,
+              );
+              const firstCell = tableMap[0][0].cell;
+              const lastCell = tableMap[tableMap.length - 1].at(-1)!.cell;
               newSelection.focus.set(
-                tableNode.getParentOrThrow().getKey(),
-                tableNode.getIndexWithinParent(),
+                isBackward ? firstCell.getKey() : lastCell.getKey(),
+                isBackward
+                  ? firstCell.getChildrenSize()
+                  : lastCell.getChildrenSize(),
                 'element',
               );
             } else {
@@ -1256,7 +1287,7 @@ function $removeHighlightFromDOM(
   element.style.removeProperty('caret-color');
 }
 
-function $findCellNode(node: LexicalNode): null | TableCellNode {
+export function $findCellNode(node: LexicalNode): null | TableCellNode {
   const cellNode = $findMatchingParent(node, $isTableCellNode);
   return $isTableCellNode(cellNode) ? cellNode : null;
 }
@@ -1283,37 +1314,112 @@ function $handleArrowKey(
   const selection = $getSelection();
 
   if (!$isSelectionInTable(selection, tableNode)) {
-    if (
-      direction === 'backward' &&
-      $isRangeSelection(selection) &&
-      selection.isCollapsed()
-    ) {
-      const anchorType = selection.anchor.type;
-      const anchorOffset = selection.anchor.offset;
-      if (
-        anchorType !== 'element' &&
-        !(anchorType === 'text' && anchorOffset === 0)
+    if ($isRangeSelection(selection)) {
+      if (selection.isCollapsed() && direction === 'backward') {
+        const anchorType = selection.anchor.type;
+        const anchorOffset = selection.anchor.offset;
+        if (
+          anchorType !== 'element' &&
+          !(anchorType === 'text' && anchorOffset === 0)
+        ) {
+          return false;
+        }
+        const anchorNode = selection.anchor.getNode();
+        if (!anchorNode) {
+          return false;
+        }
+        const parentNode = $findMatchingParent(
+          anchorNode,
+          (n) => $isElementNode(n) && !n.isInline(),
+        );
+        if (!parentNode) {
+          return false;
+        }
+        const siblingNode = parentNode.getPreviousSibling();
+        if (!siblingNode || !$isTableNode(siblingNode)) {
+          return false;
+        }
+        stopEvent(event);
+        siblingNode.selectEnd();
+        return true;
+      } else if (
+        event.shiftKey &&
+        (direction === 'up' || direction === 'down')
       ) {
-        return false;
+        const anchorNode = selection.anchor.getNode();
+        if ($isRootOrShadowRoot(anchorNode)) {
+          const selectedNode = selection.getNodes()[0];
+          if (selectedNode) {
+            const tableCellNode = $findMatchingParent(
+              selectedNode,
+              $isTableCellNode,
+            );
+            if (tableCellNode && tableNode.isParentOf(tableCellNode)) {
+              const firstDescendant = tableNode.getFirstDescendant();
+              const lastDescendant = tableNode.getLastDescendant();
+              if (!firstDescendant || !lastDescendant) {
+                return false;
+              }
+              const [firstCellNode] = $getNodeTriplet(firstDescendant);
+              const [lastCellNode] = $getNodeTriplet(lastDescendant);
+              const firstCellCoords = tableNode.getCordsFromCellNode(
+                firstCellNode,
+                tableObserver.table,
+              );
+              const lastCellCoords = tableNode.getCordsFromCellNode(
+                lastCellNode,
+                tableObserver.table,
+              );
+              const firstCellDOM = tableNode.getDOMCellFromCordsOrThrow(
+                firstCellCoords.x,
+                firstCellCoords.y,
+                tableObserver.table,
+              );
+              const lastCellDOM = tableNode.getDOMCellFromCordsOrThrow(
+                lastCellCoords.x,
+                lastCellCoords.y,
+                tableObserver.table,
+              );
+              tableObserver.setAnchorCellForSelection(firstCellDOM);
+              tableObserver.setFocusCellForSelection(lastCellDOM, true);
+              return true;
+            }
+          }
+          return false;
+        } else {
+          const anchorParentNode = $findMatchingParent(
+            anchorNode,
+            (n) => $isElementNode(n) && !n.isInline(),
+          );
+          if (!anchorParentNode) {
+            return false;
+          }
+          const sibling =
+            direction === 'down'
+              ? anchorParentNode.getNextSibling()
+              : anchorParentNode.getPreviousSibling();
+          if (
+            $isTableNode(sibling) &&
+            tableObserver.tableNodeKey === sibling.getKey()
+          ) {
+            const firstDescendant = sibling.getFirstDescendant();
+            const lastDescendant = sibling.getLastDescendant();
+            if (!firstDescendant || !lastDescendant) {
+              return false;
+            }
+            const [firstCellNode] = $getNodeTriplet(firstDescendant);
+            const [lastCellNode] = $getNodeTriplet(lastDescendant);
+            const newSelection = selection.clone();
+            newSelection.focus.set(
+              (direction === 'up' ? firstCellNode : lastCellNode).getKey(),
+              direction === 'up' ? 0 : lastCellNode.getChildrenSize(),
+              'element',
+            );
+            $setSelection(newSelection);
+            return true;
+          }
+        }
       }
-      const anchorNode = selection.anchor.getNode();
-      if (!anchorNode) {
-        return false;
-      }
-      const parentNode = $findMatchingParent(
-        anchorNode,
-        (n) => $isElementNode(n) && !n.isInline(),
-      );
-      if (!parentNode) {
-        return false;
-      }
-      const siblingNode = parentNode.getPreviousSibling();
-      if (!siblingNode || !$isTableNode(siblingNode)) {
-        return false;
-      }
-      stopEvent(event);
-      siblingNode.selectEnd();
-      return true;
     }
     return false;
   }
@@ -1356,6 +1462,11 @@ function $handleArrowKey(
       const anchorOffset = anchor.offset;
       const anchorNode = anchor.getNode();
       if (!anchorNode) {
+        return false;
+      }
+
+      const selectedNodes = selection.getNodes();
+      if (selectedNodes.length === 1 && $isDecoratorNode(selectedNodes[0])) {
         return false;
       }
 
@@ -1649,9 +1760,19 @@ function $getTableEdgeCursorPosition(
   selection: RangeSelection,
   tableNode: TableNode,
 ) {
+  const tableNodeParent = tableNode.getParent();
+  if (!tableNodeParent) {
+    return undefined;
+  }
+
+  const tableNodeParentDOM = editor.getElementByKey(tableNodeParent.getKey());
+  if (!tableNodeParentDOM) {
+    return undefined;
+  }
+
   // TODO: Add support for nested tables
   const domSelection = window.getSelection();
-  if (!domSelection || domSelection.anchorNode !== editor.getRootElement()) {
+  if (!domSelection || domSelection.anchorNode !== tableNodeParentDOM) {
     return undefined;
   }
 
